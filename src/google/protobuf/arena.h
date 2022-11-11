@@ -92,6 +92,14 @@ class TcParser;              // defined in generated_message_tctable_impl.h
 template <typename Type>
 class GenericTypeHandler;  // defined in repeated_field.h
 
+// Rather than use SFINAE that must fully cover the space of options in a
+// mutually exclusive fashion, we use implicit conversions to base classes
+// to force an explicit ranking for our preferences.  The lowest ranked
+// version that compiles will be accepted.
+struct Rank2 {};
+struct Rank1 : Rank2 {};
+struct Rank0 : Rank1 {};
+
 template <bool destructor_skippable, typename T>
 struct ObjectDestructor {
   constexpr static void (*destructor)(void*) =
@@ -270,8 +278,14 @@ class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8) Arena final {
   // is obtained from the arena).
   template <typename T, typename... Args>
   PROTOBUF_NDEBUG_INLINE static T* Create(Arena* arena, Args&&... args) {
-    return CreateInternal<T>(arena, std::is_convertible<T*, MessageLite*>(),
-                             static_cast<Args&&>(args)...);
+    if (arena == nullptr) {
+      return new T(std::forward<Args>(args)...);
+    }
+    auto destructor =
+        internal::ObjectDestructor<std::is_trivially_destructible<T>::value,
+                                   T>::destructor;
+    return new (arena->AllocateInternal(sizeof(T), alignof(T), destructor))
+        T(std::forward<Args>(args)...);
   }
 
   // API to delete any objects not on an arena.  This can be used to safely
@@ -346,7 +360,15 @@ class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8) Arena final {
   // when the arena is destroyed or reset.
   template <typename T>
   PROTOBUF_ALWAYS_INLINE void Own(T* object) {
-    OwnInternal(object, std::is_convertible<T*, MessageLite*>());
+    // Collapsing all template instantiations to one for generic Message reduces
+    // code size, using the virtual destructor instead.
+    using TypeToUse =
+        std::conditional_t<std::is_convertible<T*, MessageLite*>::value,
+                           MessageLite, T>;
+    if (object != nullptr) {
+      impl_.AddCleanup(static_cast<TypeToUse*>(object),
+                       &internal::arena_delete_object<TypeToUse>);
+    }
   }
 
   // Adds |object| to a list of objects whose destructors will be manually
@@ -388,81 +410,65 @@ class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8) Arena final {
     using EnableIfArena =
         typename std::enable_if<std::is_same<Arena*, U>::value, Arena*>::type;
 
-    // Rather than use SFINAE that must fully cover the space of options in a
-    // mutually exclusive fashion, we use implicit conversions to base classes
-    // to force an explicit ranking for our preferences.  The lowest ranked
-    // version that compiles will be accepted.
-    struct Rank2 {};
-    struct Rank1 : Rank2 {};
-    struct Rank0 : Rank1 {};
-
     static Arena* GetOwningArena(const T* p) {
-      return GetOwningArena(Rank0{}, p);
+      return GetOwningArena(internal::Rank0{}, p);
     }
 
     template <typename U>
-    static auto GetOwningArena(Rank0, const U* p)
+    static auto GetOwningArena(internal::Rank0, const U* p)
         -> EnableIfArena<decltype(p->GetOwningArena())> {
       return p->GetOwningArena();
     }
 
     template <typename U>
-    static Arena* GetOwningArena(Rank1, const U* p) {
+    static Arena* GetOwningArena(internal::Rank1, const U* p) {
       return nullptr;
     }
 
     static void InternalSwap(T* a, T* b) { a->InternalSwap(b); }
 
     static Arena* GetArenaForAllocation(const T* p) {
-      return GetArenaForAllocation(Rank0{}, p);
+      return GetArenaForAllocation(internal::Rank0{}, p);
     }
 
     static Arena* GetArena(const T* p) {
       // Rather than replicate probing for `GetArena` with fallback to nullptr,
       // we borrow the implementation of `GetArenaForAllocation` but skip
       // `Rank0` which probes for `GetArenaForAllocation`.
-      return GetArenaForAllocation(Rank1{}, p);
+      return GetArenaForAllocation(internal::Rank1{}, p);
     }
 
     template <typename U>
-    static auto GetArenaForAllocation(Rank0, const U* p)
+    static auto GetArenaForAllocation(internal::Rank0, const U* p)
         -> EnableIfArena<decltype(p->GetArenaForAllocation())> {
       return p->GetArenaForAllocation();
     }
 
     template <typename U>
-    static auto GetArenaForAllocation(Rank1, const U* p)
+    static auto GetArenaForAllocation(internal::Rank1, const U* p)
         -> EnableIfArena<decltype(p->GetArena())> {
       return p->GetArena();
     }
 
     template <typename U>
-    static Arena* GetArenaForAllocation(Rank2, const U* p) {
+    static Arena* GetArenaForAllocation(internal::Rank2, const U* p) {
       return nullptr;
     }
 
-    template <typename U>
-    static char DestructorSkippable(const typename U::DestructorSkippable_*);
-    template <typename U>
-    static double DestructorSkippable(...);
-
-    typedef std::integral_constant<
-        bool, sizeof(DestructorSkippable<T>(static_cast<const T*>(0))) ==
-                      sizeof(char) ||
-                  std::is_trivially_destructible<T>::value>
-        is_destructor_skippable;
+    template <template <typename> class Prop, typename = void>
+    struct IsDetected : std::false_type {};
+    template <template <typename> class Prop>
+    struct IsDetected<Prop, absl::void_t<Prop<T>>> : std::true_type {};
 
     template <typename U>
-    static char ArenaConstructable(
-        const typename U::InternalArenaConstructable_*);
+    using DestructorSkippableProp = typename U::DestructorSkippable_;
+    using is_destructor_skippable =
+        absl::disjunction<IsDetected<DestructorSkippableProp>,
+                          std::is_trivially_destructible<T>>;
+
     template <typename U>
-    static double ArenaConstructable(...);
-
-    typedef std::integral_constant<bool, sizeof(ArenaConstructable<T>(
-                                             static_cast<const T*>(0))) ==
-                                             sizeof(char)>
-        is_arena_constructable;
-
+    using ArenaConstructableProp = typename U::InternalArenaConstructable_;
+    using is_arena_constructable = IsDetected<ArenaConstructableProp>;
 
     template <typename... Args>
     static T* Construct(void* ptr, Args&&... args) {
@@ -572,30 +578,26 @@ class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8) Arena final {
     }
   }
 
+  // If `cond` is true, invokes `if`, otherwise invokes `else`.
+  template <bool cond, typename If, typename Else>
+  static auto IfConstexpr(If if_, Else else_)
+      -> decltype(std::get<cond>(std::make_tuple(else_, if_))()) {
+    return std::get<cond>(std::make_tuple(else_, if_))();
+  }
+
   // CreateMessage<T> requires that T supports arenas, but this private method
   // works whether or not T supports arenas. These are not exposed to user code
   // as it can cause confusing API usages, and end up having double free in
   // user code. These are used only internally from LazyField and Repeated
   // fields, since they are designed to work in all mode combinations.
-  template <typename Msg, typename... Args>
-  PROTOBUF_ALWAYS_INLINE static Msg* DoCreateMaybeMessage(Arena* arena,
-                                                          std::true_type,
-                                                          Args&&... args) {
-    return CreateMessageInternal<Msg>(arena, std::forward<Args>(args)...);
-  }
-
-  template <typename T, typename... Args>
-  PROTOBUF_ALWAYS_INLINE static T* DoCreateMaybeMessage(Arena* arena,
-                                                        std::false_type,
-                                                        Args&&... args) {
-    return Create<T>(arena, std::forward<Args>(args)...);
-  }
-
   template <typename T, typename... Args>
   PROTOBUF_ALWAYS_INLINE static T* CreateMaybeMessage(Arena* arena,
                                                       Args&&... args) {
-    return DoCreateMaybeMessage<T>(arena, is_arena_constructable<T>(),
-                                   std::forward<Args>(args)...);
+    return IfConstexpr<is_arena_constructable<T>::value>(
+        [&](auto...) {
+          return CreateMessageInternal<T>(arena, std::forward<Args>(args)...);
+        },
+        [&](auto...) { return Create<T>(arena, std::forward<Args>(args)...); });
   }
 
   // Just allocate the required size for the given type assuming the
@@ -625,82 +627,15 @@ class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8) Arena final {
   // which needs to declare Map as friend of generated message.
   template <typename T, typename... Args>
   static void CreateInArenaStorage(T* ptr, Arena* arena, Args&&... args) {
-    CreateInArenaStorageInternal(ptr, arena,
-                                 typename is_arena_constructable<T>::type(),
-                                 std::forward<Args>(args)...);
+    IfConstexpr<is_arena_constructable<T>::value>(
+        [&](auto...) {
+          InternalHelper<T>::Construct(ptr, arena, std::forward<Args>(args)...);
+        },
+        [&](auto...) { new (ptr) T(std::forward<Args>(args)...); });
+
     if (arena != nullptr) {
-      RegisterDestructorInternal(
-          ptr, arena,
-          typename InternalHelper<T>::is_destructor_skippable::type());
-    }
-  }
-
-  template <typename T, typename... Args>
-  static void CreateInArenaStorageInternal(T* ptr, Arena* arena,
-                                           std::true_type, Args&&... args) {
-    InternalHelper<T>::Construct(ptr, arena, std::forward<Args>(args)...);
-  }
-  template <typename T, typename... Args>
-  static void CreateInArenaStorageInternal(T* ptr, Arena* /* arena */,
-                                           std::false_type, Args&&... args) {
-    new (ptr) T(std::forward<Args>(args)...);
-  }
-
-  template <typename T>
-  static void RegisterDestructorInternal(T* /* ptr */, Arena* /* arena */,
-                                         std::true_type) {}
-  template <typename T>
-  static void RegisterDestructorInternal(T* ptr, Arena* arena,
-                                         std::false_type) {
-    arena->OwnDestructor(ptr);
-  }
-
-  // These implement Create(). The second parameter has type 'true_type' if T is
-  // a subtype of Message and 'false_type' otherwise.
-  template <typename T, typename... Args>
-  PROTOBUF_ALWAYS_INLINE static T* CreateInternal(Arena* arena, std::true_type,
-                                                  Args&&... args) {
-    if (arena == nullptr) {
-      return new T(std::forward<Args>(args)...);
-    } else {
-      auto destructor =
-          internal::ObjectDestructor<std::is_trivially_destructible<T>::value,
-                                     T>::destructor;
-      T* result =
-          new (arena->AllocateInternal(sizeof(T), alignof(T), destructor))
-              T(std::forward<Args>(args)...);
-      return result;
-    }
-  }
-  template <typename T, typename... Args>
-  PROTOBUF_ALWAYS_INLINE static T* CreateInternal(Arena* arena, std::false_type,
-                                                  Args&&... args) {
-    if (arena == nullptr) {
-      return new T(std::forward<Args>(args)...);
-    } else {
-      auto destructor =
-          internal::ObjectDestructor<std::is_trivially_destructible<T>::value,
-                                     T>::destructor;
-      return new (arena->AllocateInternal(sizeof(T), alignof(T), destructor))
-          T(std::forward<Args>(args)...);
-    }
-  }
-
-  // These implement Own(), which registers an object for deletion (destructor
-  // call and operator delete()). The second parameter has type 'true_type' if T
-  // is a subtype of Message and 'false_type' otherwise. Collapsing
-  // all template instantiations to one for generic Message reduces code size,
-  // using the virtual destructor instead.
-  template <typename T>
-  PROTOBUF_ALWAYS_INLINE void OwnInternal(T* object, std::true_type) {
-    if (object != nullptr) {
-      impl_.AddCleanup(object, &internal::arena_delete_object<MessageLite>);
-    }
-  }
-  template <typename T>
-  PROTOBUF_ALWAYS_INLINE void OwnInternal(T* object, std::false_type) {
-    if (object != nullptr) {
-      impl_.AddCleanup(object, &internal::arena_delete_object<T>);
+      IfConstexpr<!is_destructor_skippable<T>::value>(
+          [&] { arena->OwnDestructor(ptr); }, [] {});
     }
   }
 
