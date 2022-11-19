@@ -663,6 +663,15 @@
 #define PROTOBUF_CONSTEXPR
 #endif
 
+// DEFOLD
+#if defined(DM_DISABLE_CONSTINIT)
+#undef PROTOBUF_CONSTINIT
+#undef PROTOBUF_CONSTEXPR
+#define PROTOBUF_CONSTINIT
+#define PROTOBUF_CONSTEXPR
+#endif
+// END DEFOLD
+
 // Some globals with an empty non-trivial destructor are annotated with
 // no_destroy for performance reasons. It reduces the cost of these globals in
 // non-opt mode and under sanitizers.

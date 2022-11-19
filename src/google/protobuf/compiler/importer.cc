@@ -417,10 +417,14 @@ DiskSourceTree::DiskFileToVirtualFile(const std::string& disk_file,
   for (int i = 0; i < mapping_index; i++) {
     if (ApplyMapping(*virtual_file, mappings_[i].virtual_path,
                      mappings_[i].disk_path, shadowing_disk_file)) {
-      if (access(shadowing_disk_file->c_str(), F_OK) >= 0) {
+      // DEFOLD
+      struct stat stat_buffer;
+      if ((stat(shadowing_disk_file->c_str(), &stat_buffer) == 0)) {
+      //if (access(shadowing_disk_file->c_str(), F_OK) >= 0) {
         // File exists.
         return SHADOWED;
       }
+      // END DEFOLD
     }
   }
   shadowing_disk_file->clear();
