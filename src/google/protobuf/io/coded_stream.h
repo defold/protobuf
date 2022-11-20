@@ -132,7 +132,7 @@
 #pragma runtime_checks("c", off)
 #endif
 #else
-#ifdef __APPLE__
+#if defined(DM_PROTOBUF_USE_MACHINE_ENDIAN_H) || defined(__APPLE__)
 #include <machine/endian.h>  // __BYTE_ORDER
 #elif defined(__FreeBSD__)
 #include <sys/endian.h>  // __BYTE_ORDER
